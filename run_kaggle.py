@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """Multi-GPU (2x T4) batched version of matcher.py, built for Kaggle.
 
-How it avoids a bottleneck:
-  - A pool of download threads keeps fetching images (retrying failures up
-    to 4 times) and saving each one to disk as data/_download_cache/{tpdb_id}.{ext}.
-  - Downloaded images are handed off through a queue whose capacity equals
-    --batch-size. Once that queue is full, new downloads simply pause until
-    a GPU worker frees up a slot — so at most ~one batch's worth of images
-    is ever sitting on disk, and the next batch keeps downloading in the
-    background the entire time the current batch is being matched. There's
-    no explicit "wait for batch 1, then start batch 2" step — it's a
-    continuous pipeline, which keeps both stages busy at all times instead
-    of alternating between them.
-  - Two GPU worker threads (one for device 0, one for device 1) pull
-    from that queue independently and run detection + matching, each on
-    its own model instances pinned to its own GPU (see models/gpu_worker.py).
-  - matched_identities.json is saved atomically every --batch-size results,
-    and a re-run after a crash skips tpdb_ids already recorded there.
+Batch-sequential design (each --batch-size chunk goes through two clear
+phases, one after the other, with its own progress bar):
+  1. Download phase: a pool of download threads fetches every image in the
+     current batch (retrying failures up to 4 times), saving each one to
+     disk as data/_download_cache/{tpdb_id}.{ext}. A tqdm progress bar
+     tracks this phase; the next phase only starts once the whole batch
+     has finished downloading.
+  2. Match phase: once the batch is fully downloaded, two GPU worker
+     threads (one for device 0, one for device 1) pull from that batch's
+     queue independently and run detection + matching, each on its own
+     model instances pinned to its own GPU (see models/gpu_worker.py). A
+     second tqdm progress bar tracks this phase.
+  3. matched_identities.json is saved atomically at the end of each batch,
+     and a re-run after a crash skips tpdb_ids already recorded there —
+     so it resumes at the next un-started batch, not from scratch.
 
 Usage:
     python run_kaggle.py                    # full dataset, 2 GPUs
     python run_kaggle.py --limit 200         # quick test
-    python run_kaggle.py --batch-size 10000  # smaller queue / save interval
+    python run_kaggle.py --batch-size 10000  # smaller batches
 """
 import argparse
 import json
@@ -36,6 +35,7 @@ from queue import Queue
 from typing import Optional
 
 import requests
+from tqdm import tqdm
 
 from models.data_manager import DataManager
 from models.gpu_worker import FaceMatcher
@@ -49,11 +49,6 @@ MAX_DOWNLOAD_RETRIES = 4
 RETRY_BACKOFF_SECONDS = 2
 DOWNLOAD_WORKERS = 16
 DEFAULT_BATCH_SIZE = 15000
-# How often to print a progress line, independent of --batch-size (which
-# also controls how often matched_identities.json is saved to disk).
-# Printing one line per image (114k+ lines) is what floods the notebook
-# cell and hangs the browser tab, so this is decoupled and kept small.
-PROGRESS_PRINT_INTERVAL = 1000
 GPU_DEVICE_IDS = [0, 1]
 
 
@@ -86,6 +81,11 @@ def save_matches_atomic(path: str, matches: list):
     os.replace(tmp_path, path)
 
 
+def chunked(seq: list, size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 # --- download stage ----------------------------------------------------
 
 def _guess_extension(url: str) -> str:
@@ -115,14 +115,28 @@ def download_one(entry: dict, out_dir: Path) -> Optional[tuple]:
             last_error = e
             if attempt < MAX_DOWNLOAD_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-    print(f"  [download failed after {MAX_DOWNLOAD_RETRIES} attempts] {tpdb_id} -> {last_error}", file=sys.stderr)
+    tqdm.write(f"  [download failed after {MAX_DOWNLOAD_RETRIES} attempts] {tpdb_id} -> {last_error}")
     return None
+
+
+def download_batch(batch: list, download_dir: Path, download_workers: int) -> list:
+    """Downloads every entry in this batch, blocking until all of them have
+    been attempted. Returns the list of (tpdb_id, local_path) that
+    succeeded. Shows one tqdm bar for the whole batch."""
+    results = []
+    with ThreadPoolExecutor(max_workers=download_workers) as pool:
+        futures = [pool.submit(download_one, entry, download_dir) for entry in batch]
+        for fut in tqdm(futures, desc="  downloading batch", unit="img", leave=False):
+            result = fut.result()
+            if result:
+                results.append(result)
+    return results
 
 
 # --- GPU matching stage --------------------------------------------------
 
-def gpu_worker_loop(matcher: FaceMatcher, worker_label: str, work_queue: Queue,
-                     state: dict, state_lock: threading.Lock, output_path: str, batch_size: int):
+def gpu_worker_loop(matcher: FaceMatcher, work_queue: Queue,
+                     state: dict, state_lock: threading.Lock, pbar: tqdm):
     while True:
         item = work_queue.get()
         if item is None:  # sentinel: no more work coming
@@ -133,7 +147,7 @@ def gpu_worker_loop(matcher: FaceMatcher, worker_label: str, work_queue: Queue,
         try:
             result = matcher.match(str(path))
         except Exception as e:
-            print(f"  [{worker_label}] [match failed] {tpdb_id} -> {e}", file=sys.stderr)
+            tqdm.write(f"  [match failed] {tpdb_id} -> {e}")
             result = None
         finally:
             try:
@@ -149,34 +163,33 @@ def gpu_worker_loop(matcher: FaceMatcher, worker_label: str, work_queue: Queue,
             if record:
                 state["matches"].append(record)
                 state["done_ids"].add(tpdb_id)
-                state["batch_match_count"] = state.get("batch_match_count", 0) + 1
-
-            state["processed_total"] = state.get("processed_total", 0) + 1
-            state["processed_since_save"] += 1
-            state["processed_since_print"] = state.get("processed_since_print", 0) + 1
-
-            do_save = state["processed_since_save"] >= batch_size
-            if do_save:
-                save_matches_atomic(output_path, state["matches"])
-                state["processed_since_save"] = 0
-
-            # No per-image print here on purpose — printing one line per image
-            # (114k+ lines total) floods the notebook cell output and hangs the
-            # browser tab long before the pipeline itself is anywhere near done.
-            # A compact line every PROGRESS_PRINT_INTERVAL images instead
-            # (always also printed right after a save, so "saved" state stays visible).
-            if state["processed_since_print"] >= PROGRESS_PRINT_INTERVAL or do_save:
-                batch_matches = state.get("batch_match_count", 0)
-                tag = " [saved]" if do_save else ""
-                print(
-                    f"  -- progress: {state['processed_total']} processed, "
-                    f"{len(state['matches'])} matches total "
-                    f"(+{batch_matches} recently){tag} --"
-                )
-                state["processed_since_print"] = 0
-                state["batch_match_count"] = 0
+            pbar.update(1)
 
         work_queue.task_done()
+
+
+def match_batch(downloaded: list, matchers: list, gpu_ids: list, state: dict, state_lock: threading.Lock):
+    """Matches every downloaded image in this batch, splitting the work
+    across GPU worker threads that pull independently from a shared queue
+    (whichever GPU frees up first grabs the next image — not a fixed
+    50/50 split). Blocks until the whole batch is matched. Shows one tqdm
+    bar for the whole batch."""
+    work_queue: Queue = Queue()
+    for item in downloaded:
+        work_queue.put(item)
+    for _ in matchers:
+        work_queue.put(None)
+
+    with tqdm(total=len(downloaded), desc="  matching batch", unit="img", leave=False) as pbar:
+        threads = [
+            threading.Thread(target=gpu_worker_loop, args=(m, work_queue, state, state_lock, pbar), daemon=True)
+            for m in matchers
+        ]
+        for t in threads:
+            t.start()
+        work_queue.join()
+        for t in threads:
+            t.join()
 
 
 def main():
@@ -186,7 +199,7 @@ def main():
     parser.add_argument("--output", default=OUTPUT_FILE)
     parser.add_argument("--data-dir", default=str(DATA_DIR))
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
-                         help=f"Download queue capacity + save interval (default: {DEFAULT_BATCH_SIZE})")
+                         help=f"Entries per download-then-match batch (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--download-workers", type=int, default=DOWNLOAD_WORKERS)
     parser.add_argument("--gpus", type=int, nargs="+", default=GPU_DEVICE_IDS,
                          help="GPU device ids to use, e.g. --gpus 0 1 (default: 0 1). "
@@ -207,8 +220,8 @@ def main():
     # Downloaded images live under --data-dir (which defaults to /kaggle/temp
     # on Kaggle — see models/paths.py) rather than a fixed relative path, so
     # they land on the same big, always-clean disk as everything else. Each
-    # image is removed right after it's matched (see gpu_worker_loop), but
-    # wipe any leftovers from a previous crashed run too, just in case.
+    # image is removed right after it's matched, but wipe any leftovers from
+    # a previous crashed run too, just in case.
     download_dir = Path(args.data_dir) / "_download_cache"
     if download_dir.exists():
         shutil.rmtree(download_dir)
@@ -225,47 +238,28 @@ def main():
 
     matchers = [FaceMatcher(data_dir=args.data_dir, device_id=g, data_manager=shared_data_manager) for g in gpu_ids]
 
-    work_queue: Queue = Queue(maxsize=args.batch_size)
-    state = {
-        "matches": matches, "done_ids": done_ids,
-        "processed_since_save": 0, "processed_since_print": 0,
-        "processed_total": 0, "batch_match_count": 0,
-    }
+    state = {"matches": matches, "done_ids": done_ids}
     state_lock = threading.Lock()
 
-    gpu_threads = [
-        threading.Thread(
-            target=gpu_worker_loop,
-            args=(m, f"gpu{gpu_ids[i]}" if gpu_ids[i] is not None else "cpu", work_queue,
-                  state, state_lock, args.output, args.batch_size),
-            daemon=True,
-        )
-        for i, m in enumerate(matchers)
-    ]
-    for t in gpu_threads:
-        t.start()
+    batches = list(chunked(todo, args.batch_size))
+    print(f"Starting: {len(batches)} batch(es) of up to {args.batch_size} entries each, "
+          f"{args.download_workers} download workers, {len(matchers)} GPU worker(s).")
 
-    def enqueue_download(entry):
-        result = download_one(entry, download_dir)
-        if result:
-            work_queue.put(result)  # blocks here once the queue is full — this IS the backpressure
+    for batch_num, batch in enumerate(batches, start=1):
+        print(f"Batch {batch_num}/{len(batches)} ({len(batch)} entries):")
+        downloaded = download_batch(batch, download_dir, args.download_workers)
+        failed = len(batch) - len(downloaded)
+        if failed:
+            print(f"  downloaded {len(downloaded)}/{len(batch)} ({failed} failed after retries)")
 
-    print(f"Starting download pool ({args.download_workers} workers) and {len(gpu_threads)} GPU worker(s) ...")
-    with ThreadPoolExecutor(max_workers=args.download_workers) as pool:
-        list(pool.map(enqueue_download, todo))
+        match_batch(downloaded, matchers, gpu_ids, state, state_lock)
 
-    # all downloads attempted; tell each GPU worker to stop once the queue drains
-    for _ in gpu_threads:
-        work_queue.put(None)
-    work_queue.join()
-    for t in gpu_threads:
-        t.join()
+        with state_lock:
+            save_matches_atomic(args.output, state["matches"])
+            total_matches = len(state["matches"])
+        print(f"  batch {batch_num} done — {total_matches} matches total so far. [saved]")
 
-    with state_lock:
-        save_matches_atomic(args.output, state["matches"])
-        total_matches = len(state["matches"])
-
-    print(f"Done. {total_matches} confirmed matches written to {args.output}.")
+    print(f"Done. {len(state['matches'])} confirmed matches written to {args.output}.")
 
 
 if __name__ == "__main__":

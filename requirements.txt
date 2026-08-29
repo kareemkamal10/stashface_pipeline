@@ -8,3 +8,4 @@ onnx<1.17
 Pillow
 requests
 huggingface_hub
+tqdm
