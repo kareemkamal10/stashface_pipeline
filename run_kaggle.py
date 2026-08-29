@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """Multi-GPU (2x T4) batched version of matcher.py, built for Kaggle.
 
-Batch-sequential design with prefetch (each --batch-size chunk goes through
-two phases, one after the other, each with its own progress bar — but the
-*next* batch's download phase overlaps with the *current* batch's match
-phase, so the GPUs only sit idle waiting on a download once, for batch 1):
+Batch-sequential design with prefetch. Deliberately silent while a batch is
+in progress — no live progress bar, no per-image line — only one summary
+line is printed once a phase finishes (plus warnings/errors, which always
+print immediately):
   1. Download phase: a pool of download threads fetches every image in the
      current batch (retrying failures up to 4 times), saving each one to
-     disk as data/_download_cache/{tpdb_id}.{ext}. A tqdm progress bar
-     tracks this phase.
+     disk as data/_download_cache/{tpdb_id}.{ext}. Nothing is printed until
+     the whole batch has been attempted, then one line: how many
+     downloaded, how many failed, how long it took.
   2. Match phase: once the batch is fully downloaded, two GPU worker
      threads (one for device 0, one for device 1) pull from that batch's
      queue independently and run detection + matching, each on its own
-     model instances pinned to its own GPU (see models/gpu_worker.py). A
-     second tqdm progress bar tracks this phase. The *next* batch's
-     download phase is kicked off on a background thread right before this
-     starts, so it runs concurrently instead of after.
+     model instances pinned to its own GPU (see models/gpu_worker.py). The
+     *next* batch's download phase is kicked off on a background thread
+     right before this starts, so it runs concurrently instead of after —
+     the GPUs only sit idle waiting on a cold download once, for batch 1.
+     Again, nothing is printed until the whole batch is matched, then one
+     summary line.
   3. matched_identities.json is saved atomically at the end of each batch,
      and a re-run after a crash skips tpdb_ids already recorded there —
      so it resumes at the next un-started batch, not from scratch.
@@ -38,7 +41,6 @@ from queue import Queue
 from typing import Optional
 
 import requests
-from tqdm import tqdm
 
 from models.data_manager import DataManager
 from models.gpu_worker import FaceMatcher
@@ -89,6 +91,17 @@ def chunked(seq: list, size: int):
         yield seq[i:i + size]
 
 
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
 # --- download stage ----------------------------------------------------
 
 def _guess_extension(url: str) -> str:
@@ -118,33 +131,29 @@ def download_one(entry: dict, out_dir: Path) -> Optional[tuple]:
             last_error = e
             if attempt < MAX_DOWNLOAD_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-    tqdm.write(f"  [download failed after {MAX_DOWNLOAD_RETRIES} attempts] {tpdb_id} -> {last_error}")
+    print(f"  [WARNING] download failed after {MAX_DOWNLOAD_RETRIES} attempts: {tpdb_id} -> {last_error}",
+          file=sys.stderr)
     return None
 
 
-def download_batch(batch: list, download_dir: Path, download_workers: int, position: int = 0) -> list:
+def download_batch(batch: list, download_dir: Path, download_workers: int) -> tuple[list, float]:
     """Downloads every entry in this batch, blocking until all of them have
-    been attempted. Returns the list of (tpdb_id, local_path) that
-    succeeded. Shows one tqdm bar for the whole batch, pinned to its own
-    terminal line via `position` so it doesn't collide with a bar running
-    concurrently on another thread (e.g. the match-phase bar during
-    prefetch) — without a fixed position, two bars racing to write '\\r'
-    to the same line print a new line each update instead of overwriting."""
+    been attempted. Silent — no progress bar, no per-image output — the
+    caller prints a single summary line once this returns. Returns
+    (results, elapsed_seconds)."""
+    start = time.monotonic()
     results = []
     with ThreadPoolExecutor(max_workers=download_workers) as pool:
-        futures = [pool.submit(download_one, entry, download_dir) for entry in batch]
-        for fut in tqdm(futures, desc="  downloading batch", unit="img", leave=False,
-                         position=position, mininterval=0.5, dynamic_ncols=True):
-            result = fut.result()
+        for result in pool.map(lambda entry: download_one(entry, download_dir), batch):
             if result:
                 results.append(result)
-    return results
+    return results, time.monotonic() - start
 
 
 # --- GPU matching stage --------------------------------------------------
 
 def gpu_worker_loop(matcher: FaceMatcher, work_queue: Queue,
-                     state: dict, state_lock: threading.Lock, pbar: tqdm):
+                     state: dict, state_lock: threading.Lock):
     while True:
         item = work_queue.get()
         if item is None:  # sentinel: no more work coming
@@ -155,7 +164,7 @@ def gpu_worker_loop(matcher: FaceMatcher, work_queue: Queue,
         try:
             result = matcher.match(str(path))
         except Exception as e:
-            tqdm.write(f"  [match failed] {tpdb_id} -> {e}")
+            print(f"  [WARNING] match failed for {tpdb_id} -> {e}", file=sys.stderr)
             result = None
         finally:
             try:
@@ -171,36 +180,34 @@ def gpu_worker_loop(matcher: FaceMatcher, work_queue: Queue,
             if record:
                 state["matches"].append(record)
                 state["done_ids"].add(tpdb_id)
-            pbar.update(1)
 
         work_queue.task_done()
 
 
-def match_batch(downloaded: list, matchers: list, gpu_ids: list, state: dict, state_lock: threading.Lock,
-                 position: int = 1):
+def match_batch(downloaded: list, matchers: list, state: dict, state_lock: threading.Lock) -> float:
     """Matches every downloaded image in this batch, splitting the work
     across GPU worker threads that pull independently from a shared queue
     (whichever GPU frees up first grabs the next image — not a fixed
-    50/50 split). Blocks until the whole batch is matched. Shows one tqdm
-    bar for the whole batch, pinned to its own terminal line (see
-    download_batch's docstring for why `position` matters here)."""
+    50/50 split). Blocks until the whole batch is matched. Silent — no
+    progress bar — the caller prints a single summary line once this
+    returns. Returns elapsed_seconds."""
+    start = time.monotonic()
     work_queue: Queue = Queue()
     for item in downloaded:
         work_queue.put(item)
     for _ in matchers:
         work_queue.put(None)
 
-    with tqdm(total=len(downloaded), desc="  matching batch", unit="img", leave=False,
-              position=position, mininterval=0.5, dynamic_ncols=True) as pbar:
-        threads = [
-            threading.Thread(target=gpu_worker_loop, args=(m, work_queue, state, state_lock, pbar), daemon=True)
-            for m in matchers
-        ]
-        for t in threads:
-            t.start()
-        work_queue.join()
-        for t in threads:
-            t.join()
+    threads = [
+        threading.Thread(target=gpu_worker_loop, args=(m, work_queue, state, state_lock), daemon=True)
+        for m in matchers
+    ]
+    for t in threads:
+        t.start()
+    work_queue.join()
+    for t in threads:
+        t.join()
+    return time.monotonic() - start
 
 
 def main():
@@ -267,13 +274,12 @@ def main():
             if batches else None
 
         for batch_num, batch in enumerate(batches, start=1):
-            print(f"Batch {batch_num}/{len(batches)} ({len(batch)} entries):")
-
-            downloaded = next_download.result()  # was prefetched during the previous batch's matching (or, for
-            # batch 1, this is the only point where we actually wait on a download)
+            downloaded, download_seconds = next_download.result()  # was prefetched during the previous batch's
+            # matching (or, for batch 1, this is the only point where we actually wait on a download)
             failed = len(batch) - len(downloaded)
-            if failed:
-                print(f"  downloaded {len(downloaded)}/{len(batch)} ({failed} failed after retries)")
+            fail_note = f", {failed} failed" if failed else ""
+            print(f"Batch {batch_num}/{len(batches)}: downloaded {len(downloaded)}/{len(batch)} "
+                  f"in {_fmt_duration(download_seconds)}{fail_note}.")
 
             # Kick off the next batch's download now, before matching starts,
             # so it runs concurrently with the GPU work below.
@@ -281,12 +287,15 @@ def main():
                 next_batch = batches[batch_num]  # batches is 0-indexed, batch_num is 1-indexed -> this IS batch_num+1
                 next_download = prefetch_pool.submit(download_batch, next_batch, download_dir, args.download_workers)
 
-            match_batch(downloaded, matchers, gpu_ids, state, state_lock)
+            before = len(state["matches"])
+            match_seconds = match_batch(downloaded, matchers, state, state_lock)
+            batch_matches = len(state["matches"]) - before
 
             with state_lock:
                 save_matches_atomic(args.output, state["matches"])
                 total_matches = len(state["matches"])
-            print(f"  batch {batch_num} done — {total_matches} matches total so far. [saved]")
+            print(f"Batch {batch_num}/{len(batches)}: matched {len(downloaded)} images "
+                  f"in {_fmt_duration(match_seconds)} (+{batch_matches} matches, {total_matches} total). [saved]")
 
     print(f"Done. {len(state['matches'])} confirmed matches written to {args.output}.")
 
