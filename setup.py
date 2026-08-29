@@ -8,6 +8,10 @@ Usage:
     python setup.py                          # -> ./data
     python setup.py --data-dir /mnt/data      # custom location
     python setup.py --skip-install            # only sync the bucket
+    python setup.py --clean                   # wipe ./data first, then sync
+                                               # (use if a previous sync was
+                                               # interrupted and left corrupted
+                                               # files, e.g. a RocksDB error)
 
 Requires an HF token with read access to the bucket if it's private:
     hf auth login
@@ -15,6 +19,7 @@ Requires an HF token with read access to the bucket if it's private:
 """
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -53,7 +58,14 @@ def main():
     parser.add_argument("--data-dir", default="data", help="Where to sync the bucket to (default: ./data)")
     parser.add_argument("--bucket", default=DEFAULT_BUCKET, help=f"Bucket id (default: {DEFAULT_BUCKET})")
     parser.add_argument("--skip-install", action="store_true", help="Skip pip install, only sync the bucket")
+    parser.add_argument("--clean", action="store_true",
+                         help="Delete the data-dir first, then sync — use this if a previous sync got "
+                              "interrupted and left partial/corrupted files (e.g. a RocksDB 'Corruption' error)")
     args = parser.parse_args()
+
+    if args.clean and Path(args.data_dir).exists():
+        print(f"--clean: removing existing '{args.data_dir}/' first ...")
+        shutil.rmtree(args.data_dir)
 
     if not args.skip_install:
         install_requirements()
