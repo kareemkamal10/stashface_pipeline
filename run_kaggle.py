@@ -36,6 +36,7 @@ from typing import Optional
 
 import requests
 
+from models.data_manager import DataManager
 from models.gpu_worker import FaceMatcher
 from models.paths import DATA_DIR
 
@@ -184,7 +185,15 @@ def main():
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     gpu_ids = args.gpus if args.gpus else [None]  # empty --gpus -> single CPU worker
-    matchers = [FaceMatcher(data_dir=args.data_dir, device_id=g) for g in gpu_ids]
+
+    print("Opening performers.zvec (shared across all GPU workers) ...")
+    shared_data_manager = DataManager(collection_path=str(Path(args.data_dir) / "performers.zvec"))
+    if shared_data_manager.collection is None:
+        print(f"ERROR: could not open performers.zvec under {args.data_dir} — "
+              f"did setup.py finish syncing the bucket?", file=sys.stderr)
+        sys.exit(1)
+
+    matchers = [FaceMatcher(data_dir=args.data_dir, device_id=g, data_manager=shared_data_manager) for g in gpu_ids]
 
     work_queue: Queue = Queue(maxsize=args.batch_size)
     state = {"matches": matches, "done_ids": done_ids, "processed_since_save": 0}
