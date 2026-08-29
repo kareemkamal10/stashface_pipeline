@@ -249,14 +249,25 @@ def extract_faces_batch(
 
 
 def _get_onnx_providers():
-    if "CUDAExecutionProvider" not in ort.get_available_providers():
+    if not _cuda_runtime_available():
         return ["CPUExecutionProvider"]
+    return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+
+def _cuda_runtime_available() -> bool:
+    """True only if CUDAExecutionProvider is both compiled in AND its
+    runtime shared libraries (cuDNN/cuBLAS) actually load. Compile-time
+    presence in ort.get_available_providers() is not enough — the library
+    can still fail to load at session-creation time if the host's
+    CUDA/cuDNN versions don't match what onnxruntime-gpu was built against."""
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        return False
     try:
         import ctypes
         ctypes.CDLL("libcudnn.so.9")
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        return True
     except OSError:
-        return ["CPUExecutionProvider"]
+        return False
 
 
 def _providers_for_device(device_id: int | None):
@@ -265,7 +276,7 @@ def _providers_for_device(device_id: int | None):
     and AdaFaceEmbedder for multi-GPU pipelines. device_id=None means CPU."""
     if device_id is None:
         return ["CPUExecutionProvider"]
-    if "CUDAExecutionProvider" not in ort.get_available_providers():
+    if not _cuda_runtime_available():
         return ["CPUExecutionProvider"]
     return [("CUDAExecutionProvider", {"device_id": device_id}), "CPUExecutionProvider"]
 

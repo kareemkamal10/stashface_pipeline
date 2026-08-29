@@ -42,6 +42,15 @@ class FaceMatcher:
         adaface_model_path = str(Path(data_dir) / "adaface" / "adaface_vit_b_mha_fused.int8q.onnx")
         self.embedder = AdaFaceEmbedder(adaface_model_path, device_id=device_id)
 
+        active = self.embedder.session.get_providers()[0] if getattr(self.embedder, "session", None) else "?"
+        if device_id is not None and active != "CUDAExecutionProvider":
+            print(
+                f"[{label}] WARNING: running on CPU, not GPU — CUDA is unusable "
+                "(mismatched onnxruntime-gpu/CUDA/cuDNN versions). "
+                "Check the pip-install cell pins onnxruntime-gpu to a version "
+                "matching this host's CUDA version."
+            )
+
         # IMPORTANT: don't open a second independent handle on the same
         # performers.zvec file per GPU worker — pass one shared DataManager
         # in (built once by the caller) instead. Two workers opening it
