@@ -86,7 +86,20 @@ REFERENCE_LANDMARKS = np.array([
 ], dtype=np.float32)
 
 
-def extract_faces(image, min_confidence=MIN_FACE_CONFIDENCE, det_size=None, analyzer=None):
+def extract_faces(image, min_confidence=MIN_FACE_CONFIDENCE, det_size=None, analyzer=None,
+                   analyzer_cache=None, device_id=None):
+    """
+    analyzer_cache / device_id: for multi-GPU pipelines. Pass an empty dict
+    you own (one per GPU worker) as analyzer_cache and that worker's GPU id
+    as device_id, and this function will build+cache analyzers pinned to
+    that device (same adaptive-sizing + fallback-on-miss behavior as the
+    default single-GPU path below, just scoped to your own cache/device
+    instead of the module-level one). Leave both as None for the default
+    single-GPU/CPU behavior.
+    """
+    cache = analyzer_cache if analyzer_cache is not None else _adaptive_analyzers
+    build = (lambda size: build_face_analyzer(device_id=device_id, det_size=size)) if device_id is not None else _build_analyzer
+
     if analyzer is None:
         if det_size is None:
             h, w = image.shape[:2]
@@ -94,22 +107,19 @@ def extract_faces(image, min_confidence=MIN_FACE_CONFIDENCE, det_size=None, anal
             target = min(target, 640)
             target = ((target + 31) // 32) * 32
             det_size = (target, target)
-        analyzer = _adaptive_analyzers.get(det_size)
+        analyzer = cache.get(det_size)
         if analyzer is None:
-            analyzer = _build_analyzer(det_size)
-            _adaptive_analyzers[det_size] = analyzer
-    # else: use the analyzer that was explicitly passed in, as-is — this
-    # matters for multi-GPU pipelines (see gpu_worker.py), where each
-    # worker's analyzer is pinned to its own device and must not fall back
-    # to the module-level single-GPU/CPU cache above.
+            analyzer = build(det_size)
+            cache[det_size] = analyzer
+    # else: use the analyzer that was explicitly passed in, as-is.
     detected = analyzer.get(image)
     if not detected and det_size is not None and det_size[0] >= 576:
         for sz in [544, 480, 416, 352]:
             key = (sz, sz)
-            alt = _adaptive_analyzers.get(key)
+            alt = cache.get(key)
             if alt is None:
-                alt = _build_analyzer(key)
-                _adaptive_analyzers[key] = alt
+                alt = build(key)
+                cache[key] = alt
             detected = alt.get(image)
             if detected:
                 break

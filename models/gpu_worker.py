@@ -15,7 +15,6 @@ from models.data_manager import DataManager
 from models.face_recognition import (
     AdaFaceEmbedder,
     MIN_FACE_CONFIDENCE,
-    build_face_analyzer,
     extract_faces,
 )
 from models.image_processor import MIN_COSINE_SIMILARITY, _score_to_cosine
@@ -27,18 +26,38 @@ class FaceMatcher:
         data_dir,
         device_id: Optional[int] = None,
         collection_path: Optional[str] = None,
-        det_size=(640, 640),
+        data_manager: Optional[DataManager] = None,
     ):
         self.device_id = device_id
         label = f"GPU {device_id}" if device_id is not None else "CPU"
-        print(f"[{label}] loading face detector + AdaFace model ...")
+        print(f"[{label}] loading AdaFace model ...")
 
-        self.analyzer = build_face_analyzer(device_id=device_id, det_size=det_size)
+        # Analyzers are built lazily, per detection size, the first time
+        # they're needed (see extract_faces(analyzer_cache=..., device_id=...))
+        # — same adaptive-size + retry-on-miss behavior as the default
+        # single-GPU path, just kept in this worker's own cache so it never
+        # touches another worker's GPU.
+        self._analyzer_cache: dict = {}
+
         adaface_model_path = str(Path(data_dir) / "adaface" / "adaface_vit_b_mha_fused.int8q.onnx")
         self.embedder = AdaFaceEmbedder(adaface_model_path, device_id=device_id)
-        self.data_manager = DataManager(
+
+        # IMPORTANT: don't open a second independent handle on the same
+        # performers.zvec file per GPU worker — pass one shared DataManager
+        # in (built once by the caller) instead. Two workers opening it
+        # concurrently is not something to rely on being safe, and if the
+        # second open silently fails, every single query from that worker
+        # comes back empty — i.e. "no match" for every image, which looks
+        # exactly like a matching bug but is actually a data-loading one.
+        self.data_manager = data_manager or DataManager(
             collection_path=collection_path or str(Path(data_dir) / "performers.zvec")
         )
+        if self.data_manager.collection is None:
+            raise RuntimeError(
+                f"[{label}] performers.zvec failed to load from "
+                f"'{collection_path or str(Path(data_dir) / 'performers.zvec')}' — "
+                "check that setup.py finished syncing the bucket before running this."
+            )
 
         print(f"[{label}] ready.")
 
@@ -59,7 +78,8 @@ class FaceMatcher:
         faces = extract_faces(
             image_array,
             min_confidence=detection_threshold,
-            analyzer=self.analyzer,  # pinned to this worker's own GPU
+            analyzer_cache=self._analyzer_cache,  # this worker's own cache
+            device_id=self.device_id,              # ... pinned to its own GPU
         )
         if not faces:
             return None
