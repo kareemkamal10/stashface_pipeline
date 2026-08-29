@@ -1,5 +1,6 @@
 import io
 import base64
+import threading
 import warnings
 import os
 import sys
@@ -24,6 +25,26 @@ _adaptive_analyzers: dict[tuple[int, int], FaceAnalysis] = {}
 
 _DETECTOR_MODEL = "buffalo_l"
 
+# Guards two things that are NOT thread-safe when multiple GPU worker threads
+# build their own analyzer at the same time (e.g. run_kaggle.py's multi-GPU
+# pipeline, where each worker lazily builds its first analyzer on its own
+# thread the moment it pulls its first item off the queue):
+#   1. sys.stdout is process-global. Redirecting it to devnull to silence
+#      insightface's setup logging, then restoring it, is only safe if one
+#      thread does the whole redirect-build-restore sequence at a time —
+#      otherwise thread A can end up restoring stdout to thread B's (already
+#      closed) devnull handle, which surfaces later as
+#      "ValueError: I/O operation on closed file" from an unrelated print().
+#   2. The first FaceAnalysis(name=...) call for a given model auto-downloads
+#      and unzips that model into the shared ~/.insightface/models/<name>
+#      directory. Two threads doing this at once race on the same files,
+#      which shows up as "[Errno 17] File exists" for one thread and a
+#      corrupted/partial .onnx ("Protobuf parsing failed") for the other.
+# Serializing analyzer construction fixes both, and only costs a bit of
+# one-time startup latency (subsequent calls hit the in-memory cache and
+# never touch this lock).
+_analyzer_build_lock = threading.Lock()
+
 
 def set_detector_model(name: str):
     global _DETECTOR_MODEL
@@ -34,10 +55,12 @@ def set_detector_model(name: str):
     print(f"Detector model set to: {name}")
 
 
-def _build_analyzer(det_size, model_name=None):
-    providers = _get_onnx_providers()
-    ctx_id = 0 if providers[0] == "CUDAExecutionProvider" else -1
-    name = model_name or _DETECTOR_MODEL
+def _create_face_analysis(name, providers, ctx_id, det_size):
+    """Construct + prepare a FaceAnalysis instance with stdout silenced.
+
+    Must only ever be called while holding _analyzer_build_lock — see the
+    comment above it for why.
+    """
     with open(os.devnull, 'w') as devnull:
         old_stdout = sys.stdout
         sys.stdout = devnull
@@ -51,6 +74,14 @@ def _build_analyzer(det_size, model_name=None):
         finally:
             sys.stdout = old_stdout
     return analyzer
+
+
+def _build_analyzer(det_size, model_name=None):
+    providers = _get_onnx_providers()
+    ctx_id = 0 if providers[0] == "CUDAExecutionProvider" else -1
+    name = model_name or _DETECTOR_MODEL
+    with _analyzer_build_lock:
+        return _create_face_analysis(name, providers, ctx_id, det_size)
 
 
 def _get_face_analyzer(det_size=None):
@@ -251,15 +282,8 @@ def build_face_analyzer(device_id: int | None = None, det_size=(640, 640), model
     """
     providers = _providers_for_device(device_id)
     ctx_id = device_id if device_id is not None else -1
-    with open(os.devnull, 'w') as devnull:
-        old_stdout = sys.stdout
-        sys.stdout = devnull
-        try:
-            analyzer = FaceAnalysis(name=model_name, allowed_modules=["detection"], providers=providers)
-            analyzer.prepare(ctx_id=ctx_id, det_size=det_size)
-        finally:
-            sys.stdout = old_stdout
-    return analyzer
+    with _analyzer_build_lock:
+        return _create_face_analysis(model_name, providers, ctx_id, det_size)
 
 
 # ---------------------------------------------------------------------------
