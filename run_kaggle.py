@@ -49,6 +49,11 @@ MAX_DOWNLOAD_RETRIES = 4
 RETRY_BACKOFF_SECONDS = 2
 DOWNLOAD_WORKERS = 16
 DEFAULT_BATCH_SIZE = 15000
+# How often to print a progress line, independent of --batch-size (which
+# also controls how often matched_identities.json is saved to disk).
+# Printing one line per image (114k+ lines) is what floods the notebook
+# cell and hangs the browser tab, so this is decoupled and kept small.
+PROGRESS_PRINT_INTERVAL = 1000
 GPU_DEVICE_IDS = [0, 1]
 
 
@@ -144,15 +149,32 @@ def gpu_worker_loop(matcher: FaceMatcher, worker_label: str, work_queue: Queue,
             if record:
                 state["matches"].append(record)
                 state["done_ids"].add(tpdb_id)
-                print(f"[{worker_label}] MATCH     {tpdb_id} -> {record['local_id']} ({record['cosine_score']}%)")
-            else:
-                print(f"[{worker_label}] no match  {tpdb_id}")
+                state["batch_match_count"] = state.get("batch_match_count", 0) + 1
 
+            state["processed_total"] = state.get("processed_total", 0) + 1
             state["processed_since_save"] += 1
-            if state["processed_since_save"] >= batch_size:
+            state["processed_since_print"] = state.get("processed_since_print", 0) + 1
+
+            do_save = state["processed_since_save"] >= batch_size
+            if do_save:
                 save_matches_atomic(output_path, state["matches"])
                 state["processed_since_save"] = 0
-                print(f"  -- progress saved: {len(state['matches'])} matches so far --")
+
+            # No per-image print here on purpose — printing one line per image
+            # (114k+ lines total) floods the notebook cell output and hangs the
+            # browser tab long before the pipeline itself is anywhere near done.
+            # A compact line every PROGRESS_PRINT_INTERVAL images instead
+            # (always also printed right after a save, so "saved" state stays visible).
+            if state["processed_since_print"] >= PROGRESS_PRINT_INTERVAL or do_save:
+                batch_matches = state.get("batch_match_count", 0)
+                tag = " [saved]" if do_save else ""
+                print(
+                    f"  -- progress: {state['processed_total']} processed, "
+                    f"{len(state['matches'])} matches total "
+                    f"(+{batch_matches} recently){tag} --"
+                )
+                state["processed_since_print"] = 0
+                state["batch_match_count"] = 0
 
         work_queue.task_done()
 
@@ -204,7 +226,11 @@ def main():
     matchers = [FaceMatcher(data_dir=args.data_dir, device_id=g, data_manager=shared_data_manager) for g in gpu_ids]
 
     work_queue: Queue = Queue(maxsize=args.batch_size)
-    state = {"matches": matches, "done_ids": done_ids, "processed_since_save": 0}
+    state = {
+        "matches": matches, "done_ids": done_ids,
+        "processed_since_save": 0, "processed_since_print": 0,
+        "processed_total": 0, "batch_match_count": 0,
+    }
     state_lock = threading.Lock()
 
     gpu_threads = [
