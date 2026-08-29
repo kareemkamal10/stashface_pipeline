@@ -1,0 +1,25 @@
+# Data (downloaded via setup.py from the bucket, or synced on Kaggle)
+data/
+*.zvec
+
+# Downloaded input / generated output (don't commit large or run-specific data)
+tpdb_all_performers.json
+matched_identities.json*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Jupyter / Kaggle
+.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

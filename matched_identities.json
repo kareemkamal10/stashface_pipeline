@@ -1,0 +1,37 @@
+[
+  {
+    "local_id": "bc6a5b00-aecf-4a9d-965e-39ac00f5def1",
+    "tpdb_id": "04d6634e-1a7a-4885-a57a-39c0ddd65445",
+    "cosine_score": 65.38
+  },
+  {
+    "local_id": "74d5409f-7390-4373-9118-12b93d31534e",
+    "tpdb_id": "434e3732-a119-4f66-bb00-2abe66544bae",
+    "cosine_score": 68.36
+  },
+  {
+    "local_id": "659548d8-489b-4004-b154-5e81832b1270",
+    "tpdb_id": "5dab6b08-f6d3-4abe-adbf-48bad96ebd67",
+    "cosine_score": 80.61
+  },
+  {
+    "local_id": "03a86926-cd81-47b0-b7eb-2069ea8592d0",
+    "tpdb_id": "db370233-626d-40e6-970f-9400a49a78d2",
+    "cosine_score": 69.17
+  },
+  {
+    "local_id": "03a86926-cd81-47b0-b7eb-2069ea8592d0",
+    "tpdb_id": "d859736d-b9b6-421a-a0c8-93459ff39ffb",
+    "cosine_score": 68.85
+  },
+  {
+    "local_id": "8dd2c937-70b3-479e-83e2-65eeca8554ae",
+    "tpdb_id": "44c37a61-7803-4413-be96-a6108063d44c",
+    "cosine_score": 82.76
+  },
+  {
+    "local_id": "1d20cd45-5072-4675-9a1d-7455cf3a4406",
+    "tpdb_id": "670f6d3e-b817-4917-b38d-820e90704d98",
+    "cosine_score": 72.32
+  }
+]
