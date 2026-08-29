@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Multi-GPU (2x T4) batched version of matcher.py, built for Kaggle.
 
-Batch-sequential design (each --batch-size chunk goes through two clear
-phases, one after the other, with its own progress bar):
+Batch-sequential design with prefetch (each --batch-size chunk goes through
+two phases, one after the other, each with its own progress bar — but the
+*next* batch's download phase overlaps with the *current* batch's match
+phase, so the GPUs only sit idle waiting on a download once, for batch 1):
   1. Download phase: a pool of download threads fetches every image in the
      current batch (retrying failures up to 4 times), saving each one to
      disk as data/_download_cache/{tpdb_id}.{ext}. A tqdm progress bar
-     tracks this phase; the next phase only starts once the whole batch
-     has finished downloading.
+     tracks this phase.
   2. Match phase: once the batch is fully downloaded, two GPU worker
      threads (one for device 0, one for device 1) pull from that batch's
      queue independently and run detection + matching, each on its own
      model instances pinned to its own GPU (see models/gpu_worker.py). A
-     second tqdm progress bar tracks this phase.
+     second tqdm progress bar tracks this phase. The *next* batch's
+     download phase is kicked off on a background thread right before this
+     starts, so it runs concurrently instead of after.
   3. matched_identities.json is saved atomically at the end of each batch,
      and a re-run after a crash skips tpdb_ids already recorded there —
      so it resumes at the next un-started batch, not from scratch.
@@ -245,19 +248,37 @@ def main():
     print(f"Starting: {len(batches)} batch(es) of up to {args.batch_size} entries each, "
           f"{args.download_workers} download workers, {len(matchers)} GPU worker(s).")
 
-    for batch_num, batch in enumerate(batches, start=1):
-        print(f"Batch {batch_num}/{len(batches)} ({len(batch)} entries):")
-        downloaded = download_batch(batch, download_dir, args.download_workers)
-        failed = len(batch) - len(downloaded)
-        if failed:
-            print(f"  downloaded {len(downloaded)}/{len(batch)} ({failed} failed after retries)")
+    # Prefetching: while batch N is being matched on the GPUs, batch N+1's
+    # images are already downloading in the background on a separate thread
+    # — so only the very first batch pays the full "wait for download, then
+    # match" cost. From batch 2 onward, downloading is (ideally) already
+    # done by the time the GPUs are free again. Uses a 1-worker pool as a
+    # simple way to run "download the next batch" as a background future.
+    with ThreadPoolExecutor(max_workers=1) as prefetch_pool:
+        next_download = prefetch_pool.submit(download_batch, batches[0], download_dir, args.download_workers) \
+            if batches else None
 
-        match_batch(downloaded, matchers, gpu_ids, state, state_lock)
+        for batch_num, batch in enumerate(batches, start=1):
+            print(f"Batch {batch_num}/{len(batches)} ({len(batch)} entries):")
 
-        with state_lock:
-            save_matches_atomic(args.output, state["matches"])
-            total_matches = len(state["matches"])
-        print(f"  batch {batch_num} done — {total_matches} matches total so far. [saved]")
+            downloaded = next_download.result()  # was prefetched during the previous batch's matching (or, for
+            # batch 1, this is the only point where we actually wait on a download)
+            failed = len(batch) - len(downloaded)
+            if failed:
+                print(f"  downloaded {len(downloaded)}/{len(batch)} ({failed} failed after retries)")
+
+            # Kick off the next batch's download now, before matching starts,
+            # so it runs concurrently with the GPU work below.
+            if batch_num < len(batches):
+                next_batch = batches[batch_num]  # batches is 0-indexed, batch_num is 1-indexed -> this IS batch_num+1
+                next_download = prefetch_pool.submit(download_batch, next_batch, download_dir, args.download_workers)
+
+            match_batch(downloaded, matchers, gpu_ids, state, state_lock)
+
+            with state_lock:
+                save_matches_atomic(args.output, state["matches"])
+                total_matches = len(state["matches"])
+            print(f"  batch {batch_num} done — {total_matches} matches total so far. [saved]")
 
     print(f"Done. {len(state['matches'])} confirmed matches written to {args.output}.")
 
