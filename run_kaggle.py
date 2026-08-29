@@ -122,14 +122,19 @@ def download_one(entry: dict, out_dir: Path) -> Optional[tuple]:
     return None
 
 
-def download_batch(batch: list, download_dir: Path, download_workers: int) -> list:
+def download_batch(batch: list, download_dir: Path, download_workers: int, position: int = 0) -> list:
     """Downloads every entry in this batch, blocking until all of them have
     been attempted. Returns the list of (tpdb_id, local_path) that
-    succeeded. Shows one tqdm bar for the whole batch."""
+    succeeded. Shows one tqdm bar for the whole batch, pinned to its own
+    terminal line via `position` so it doesn't collide with a bar running
+    concurrently on another thread (e.g. the match-phase bar during
+    prefetch) — without a fixed position, two bars racing to write '\\r'
+    to the same line print a new line each update instead of overwriting."""
     results = []
     with ThreadPoolExecutor(max_workers=download_workers) as pool:
         futures = [pool.submit(download_one, entry, download_dir) for entry in batch]
-        for fut in tqdm(futures, desc="  downloading batch", unit="img", leave=False):
+        for fut in tqdm(futures, desc="  downloading batch", unit="img", leave=False,
+                         position=position, mininterval=0.5, dynamic_ncols=True):
             result = fut.result()
             if result:
                 results.append(result)
@@ -171,19 +176,22 @@ def gpu_worker_loop(matcher: FaceMatcher, work_queue: Queue,
         work_queue.task_done()
 
 
-def match_batch(downloaded: list, matchers: list, gpu_ids: list, state: dict, state_lock: threading.Lock):
+def match_batch(downloaded: list, matchers: list, gpu_ids: list, state: dict, state_lock: threading.Lock,
+                 position: int = 1):
     """Matches every downloaded image in this batch, splitting the work
     across GPU worker threads that pull independently from a shared queue
     (whichever GPU frees up first grabs the next image — not a fixed
     50/50 split). Blocks until the whole batch is matched. Shows one tqdm
-    bar for the whole batch."""
+    bar for the whole batch, pinned to its own terminal line (see
+    download_batch's docstring for why `position` matters here)."""
     work_queue: Queue = Queue()
     for item in downloaded:
         work_queue.put(item)
     for _ in matchers:
         work_queue.put(None)
 
-    with tqdm(total=len(downloaded), desc="  matching batch", unit="img", leave=False) as pbar:
+    with tqdm(total=len(downloaded), desc="  matching batch", unit="img", leave=False,
+              position=position, mininterval=0.5, dynamic_ncols=True) as pbar:
         threads = [
             threading.Thread(target=gpu_worker_loop, args=(m, work_queue, state, state_lock, pbar), daemon=True)
             for m in matchers
