@@ -26,6 +26,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -49,7 +50,6 @@ RETRY_BACKOFF_SECONDS = 2
 DOWNLOAD_WORKERS = 16
 DEFAULT_BATCH_SIZE = 15000
 GPU_DEVICE_IDS = [0, 1]
-DOWNLOAD_DIR = Path("data/_download_cache")
 
 
 # --- input/output helpers (same contract as matcher.py) --------------------
@@ -182,7 +182,15 @@ def main():
         print("Nothing to do.")
         return
 
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # Downloaded images live under --data-dir (which defaults to /kaggle/temp
+    # on Kaggle — see models/paths.py) rather than a fixed relative path, so
+    # they land on the same big, always-clean disk as everything else. Each
+    # image is removed right after it's matched (see gpu_worker_loop), but
+    # wipe any leftovers from a previous crashed run too, just in case.
+    download_dir = Path(args.data_dir) / "_download_cache"
+    if download_dir.exists():
+        shutil.rmtree(download_dir)
+    download_dir.mkdir(parents=True, exist_ok=True)
 
     gpu_ids = args.gpus if args.gpus else [None]  # empty --gpus -> single CPU worker
 
@@ -212,7 +220,7 @@ def main():
         t.start()
 
     def enqueue_download(entry):
-        result = download_one(entry, DOWNLOAD_DIR)
+        result = download_one(entry, download_dir)
         if result:
             work_queue.put(result)  # blocks here once the queue is full — this IS the backpressure
 
