@@ -48,7 +48,7 @@ import numpy as np
 import requests
 from PIL import Image
 
-from models.face_recognition import AdaFaceEmbedder, MIN_FACE_CONFIDENCE, extract_faces
+from models.face_recognition import AdaFaceEmbedder, MIN_FACE_CONFIDENCE, extract_faces, _cuda_runtime_available
 from models.paths import DATA_DIR
 
 INPUT_WITH_TPDB = "performers_with_tpdb.json"
@@ -111,6 +111,29 @@ def _fmt_duration(seconds: float) -> str:
 
 def _key(entry: dict) -> str:
     return f"{entry['file_type']}:{entry['id']}"
+
+
+def report_gpu_status(embedder: AdaFaceEmbedder, device_id: Optional[int]):
+    """يطبع بصراحة هل الـ GPU شغال فعليًا ولا لأ - عشان مفيش أي fallback
+    صامت لـ CPU من غير ما تعرف."""
+    cuda_ok = _cuda_runtime_available()
+    actual_providers = embedder.session.get_providers()
+    embedder_on_gpu = bool(actual_providers) and actual_providers[0] == "CUDAExecutionProvider"
+
+    print(f"[GPU] CUDA runtime متاح فعليًا: {cuda_ok}")
+    print(f"[GPU] AdaFace embedder شغال على: {'GPU (CUDAExecutionProvider)' if embedder_on_gpu else 'CPU'} "
+          f"(providers فعلية: {actual_providers})")
+    # detection (buffalo_l) بيستخدم نفس الـ _cuda_runtime_available() تحديدًا
+    # كبوابة، فلو الـ embedder شغال GPU، الـ detection شغال GPU كمان والعكس
+    print(f"[GPU] Face detection (buffalo_l) هيشتغل على: {'GPU' if cuda_ok else 'CPU'} (نفس بوابة الـ CUDA)")
+
+    if device_id is not None and not embedder_on_gpu:
+        print(f"WARNING: طلبت GPU (--device-id {device_id}) بس الـ AdaFace embedder فعليًا شغال على CPU - "
+              f"هيبقى أبطأ بكتير من المتوقع على 126K+ صورة. راجع تثبيت onnxruntime-gpu/CUDA على البيئة.",
+              file=sys.stderr)
+    if device_id is None:
+        print("WARNING: --device-id متحددش، يعني الـ embedder هيشتغل على CPU عمدًا. "
+              "لو إنت على Kaggle GPU session، استخدم --device-id 0.", file=sys.stderr)
 
 
 # --- تحميل الصور -----------------------------------------------------------
@@ -382,6 +405,7 @@ def main():
 
     adaface_model_path = str(Path(args.data_dir) / "adaface" / "adaface_vit_b_mha_fused.int8q.onnx")
     embedder = AdaFaceEmbedder(adaface_model_path, device_id=args.device_id)
+    report_gpu_status(embedder, args.device_id)
 
     db_ids, db_names, db_file_types, db_images, embeddings = build_phase(
         entries, embedder, out_dir, args.batch_size, args.download_workers,
