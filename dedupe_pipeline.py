@@ -70,8 +70,7 @@ OUT_ACCEPTED_DB = "face_db.npz"
 OUT_DOWNLOAD_FAILED = "download_failed.json"
 OUT_NO_FACE = "no_face_detected.json"
 OUT_MULTI_FACE = "multiple_faces_detected.json"
-OUT_CONFIRMED = "confirmed_duplicates.json"
-OUT_REVIEW = "needs_human_review.json"
+OUT_GROUPS = "duplicate_groups.json"
 
 
 # --- تحميل المدخلات --------------------------------------------------------
@@ -253,7 +252,25 @@ def build_phase(all_entries: list, embedder: AdaFaceEmbedder, out_dir: Path,
     return db_ids, db_names, db_file_types, db_images, np.asarray(embeddings_buffer, dtype=np.float32)
 
 
-# --- المرحلة 2: الاستعلام -----------------------------------------------
+# --- المرحلة 2: الاستعلام (تجميع، مش أزواج) --------------------------------
+
+class _DSU:
+    """Union-Find بسيط لتجميع كل الـ ids اللي بترجع لنفس الشخص في مجموعة واحدة."""
+
+    def __init__(self, n):
+        self.parent = list(range(n))
+
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[ra] = rb
+
 
 def query_phase(db_ids, db_names, db_file_types, db_images, embeddings: np.ndarray, out_dir: Path):
     if embeddings.shape[0] == 0:
@@ -267,36 +284,61 @@ def query_phase(db_ids, db_names, db_file_types, db_images, embeddings: np.ndarr
     normed = embeddings / norms
     sims = normed @ normed.T  # matrix مربعة: sims[i, j] = تشابه العنصر i مع j
 
-    confirmed = []
-    review = []
     n = len(db_ids)
+    dsu = _DSU(n)
+
+    # لكل عنصر: نضم لنفس المجموعة أي نتيجة من أقرب top-10 (غير نفسه)
+    # تخطت أدنى threshold (55%) - ده بيمسك حتى الحالات اللي مش بعضها
+    # top-1 لبعض (زي شخص عنده 3 صور، مش كلهم متطابقين بنفس القوة)
     for i in range(n):
-        order = np.argsort(-sims[i])[:TOP_K + 1]  # +1 لأن نفسه هيكون غالبًا أول واحد
-        best = None
+        order = np.argsort(-sims[i])[:TOP_K + 1]
         for j in order:
             if db_file_types[j] == db_file_types[i] and db_ids[j] == db_ids[i]:
-                continue  # استبعاد نفس العنصر (استبعاد بالـ id، مش بالترتيب)
-            score = round(float(sims[i, j]) * 100, 2)
-            best = (j, score)
-            break
+                continue  # نفس العنصر - استبعاد بالـ id مش بالترتيب
+            score = float(sims[i, j]) * 100
+            if score >= REVIEW_THRESHOLD:
+                dsu.union(i, j)
 
-        if best is None:
+    raw_groups = {}
+    for i in range(n):
+        raw_groups.setdefault(dsu.find(i), []).append(i)
+
+    result_groups = []
+    for idxs in raw_groups.values():
+        if len(idxs) < 2:
             continue
-        j, score = best
-        record = {
-            "query_id": db_ids[i], "query_file_type": db_file_types[i], "query_name": db_names[i],
-            "match_id": db_ids[j], "match_file_type": db_file_types[j], "match_name": db_names[j],
-            "cosine_score": score,
-        }
-        if score >= CONFIRMED_THRESHOLD:
-            confirmed.append(record)
-        elif score >= REVIEW_THRESHOLD:
-            review.append(record)
 
-    save_json_atomic(str(out_dir / OUT_CONFIRMED), confirmed)
-    save_json_atomic(str(out_dir / OUT_REVIEW), review)
-    print(f"[استعلام] تطابقات مؤكدة (>= {CONFIRMED_THRESHOLD}%): {len(confirmed)}")
-    print(f"[استعلام] تحتاج مراجعة بشرية ({REVIEW_THRESHOLD}%-{CONFIRMED_THRESHOLD}%): {len(review)}")
+        # الـ anchor = العضو الأكتر تمثيلاً للمجموعة (أعلى مجموع تشابه مع
+        # باقي الأعضاء) - باقي الأعضاء بتتقاس نسبتهم بالنسبة له
+        idxs_arr = np.array(idxs)
+        sub = sims[np.ix_(idxs_arr, idxs_arr)]
+        anchor_pos = int(np.argmax(sub.sum(axis=1)))
+        anchor_idx = idxs[anchor_pos]
+
+        members = []
+        for idx in idxs:
+            score = 100.0 if idx == anchor_idx else round(float(sims[anchor_idx, idx]) * 100, 2)
+            members.append({
+                "id": db_ids[idx],
+                "file_type": db_file_types[idx],
+                "image": db_images[idx],
+                "cosine_score": score,
+                "need_review": bool(score < CONFIRMED_THRESHOLD),
+            })
+
+        # الأعلى تشابه فوق، الأقل تحت
+        members.sort(key=lambda m: m["cosine_score"], reverse=True)
+        result_groups.append({"members": members})
+
+    # المجموعات الأكبر (أكتر تكرار) الأول
+    result_groups.sort(key=lambda g: len(g["members"]), reverse=True)
+
+    save_json_atomic(str(out_dir / OUT_GROUPS), result_groups)
+
+    total_members = sum(len(g["members"]) for g in result_groups)
+    total_review = sum(1 for g in result_groups for m in g["members"] if m["need_review"])
+    print(f"[استعلام] عدد المجموعات: {len(result_groups)} (إجمالي {total_members} عنصر)")
+    print(f"[استعلام] من ضمنهم عناصر محتاجة مراجعة بشرية (need_review=true): {total_review}")
 
 
 # --- المرحلة 3: الرفع لـ HF -------------------------------------------------
@@ -304,7 +346,7 @@ def query_phase(db_ids, db_names, db_file_types, db_images, embeddings: np.ndarr
 def upload_reports(out_dir: Path, hf_dataset_id: str, hf_token: str):
     from huggingface_hub import HfApi
     api = HfApi(token=hf_token)
-    for filename in [OUT_ACCEPTED_DB, OUT_DOWNLOAD_FAILED, OUT_NO_FACE, OUT_MULTI_FACE, OUT_CONFIRMED, OUT_REVIEW]:
+    for filename in [OUT_ACCEPTED_DB, OUT_DOWNLOAD_FAILED, OUT_NO_FACE, OUT_MULTI_FACE, OUT_GROUPS]:
         local_path = out_dir / filename
         if not local_path.exists():
             continue
