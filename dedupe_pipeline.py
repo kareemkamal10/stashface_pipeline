@@ -208,10 +208,68 @@ def save_db_atomic(path: str, ids, names, file_types, images, embeddings):
     os.replace(tmp, path)
 
 
+# --- مزامنة الـ checkpoints مع HF (حماية من فقدان التقدم لو الجلسة راحت) ---
+
+CHECKPOINT_FILES = [OUT_DOWNLOAD_FAILED, OUT_NO_FACE, OUT_MULTI_FACE, OUT_ACCEPTED_DB]
+
+
+def download_checkpoint_from_hf(out_dir: Path, hf_dataset_id: str, hf_token: str):
+    """لو فيه checkpoint سابق على HF من محاولة قبل كده (حتى لو الجلسة اللي
+    عملته راحت خالص)، يحمّله محليًا الأول قبل ما نبدأ - بدل ما نبدأ من الصفر."""
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
+
+    found_any = False
+    for filename in CHECKPOINT_FILES:
+        try:
+            local_path = hf_hub_download(
+                repo_id=hf_dataset_id,
+                repo_type="dataset",
+                filename=f"{REPORTS_DIR_IN_REPO}/{filename}",
+                token=hf_token,
+            )
+        except (EntryNotFoundError, RepositoryNotFoundError):
+            continue  # مفيش checkpoint قديم للملف ده - عادي، أول تشغيلة
+        except Exception as e:  # noqa: BLE001
+            print(f"WARNING: فشل تحميل checkpoint قديم لـ {filename}: {e}", file=sys.stderr)
+            continue
+        shutil.copy(local_path, str(out_dir / filename))
+        found_any = True
+        print(f"[استعادة] لقيت checkpoint سابق على HF: {filename} - اتحمّل محليًا.")
+
+    if found_any:
+        print("[استعادة] هيكمل من آخر نقطة محفوظة على HF بدل ما يبدأ من الصفر.")
+    else:
+        print("[استعادة] مفيش checkpoint سابق على HF - هيبدأ تشغيلة جديدة.")
+
+
+def upload_checkpoint_to_hf(out_dir: Path, hf_dataset_id: str, hf_token: str):
+    """بترفع بعد كل batch - لو الجلسة راحت فجأة، آخر batch اترفع يفضل موجود
+    على HF حتى لو /kaggle/temp اتمسح بالكامل."""
+    from huggingface_hub import HfApi
+    api = HfApi(token=hf_token)
+    for filename in CHECKPOINT_FILES:
+        local_path = out_dir / filename
+        if not local_path.exists():
+            continue
+        try:
+            api.upload_file(
+                path_or_fileobj=str(local_path),
+                path_in_repo=f"{REPORTS_DIR_IN_REPO}/{filename}",
+                repo_id=hf_dataset_id,
+                repo_type="dataset",
+                token=hf_token,
+                commit_message=f"dedupe_pipeline checkpoint: {filename}",
+            )
+        except Exception as e:  # noqa: BLE001 - فشل رفع batch واحد مش لازم يوقف التشغيلة كلها
+            print(f"WARNING: فشل رفع checkpoint {filename} على HF: {e}", file=sys.stderr)
+
+
 # --- المرحلة 1: البناء -------------------------------------------------
 
 def build_phase(all_entries: list, embedder: AdaFaceEmbedder, out_dir: Path,
-                 batch_size: int, download_workers: int):
+                 batch_size: int, download_workers: int,
+                 hf_dataset_id: Optional[str] = None, hf_token: Optional[str] = None):
     download_failed = load_json_list(str(out_dir / OUT_DOWNLOAD_FAILED))
     no_face = load_json_list(str(out_dir / OUT_NO_FACE))
     multi_face = load_json_list(str(out_dir / OUT_MULTI_FACE))
@@ -269,8 +327,13 @@ def build_phase(all_entries: list, embedder: AdaFaceEmbedder, out_dir: Path,
         save_json_atomic(str(out_dir / OUT_MULTI_FACE), multi_face)
         save_db_atomic(str(out_dir / OUT_ACCEPTED_DB), db_ids, db_names, db_file_types, db_images, embeddings_buffer)
 
+        hf_note = ""
+        if hf_dataset_id and hf_token:
+            upload_checkpoint_to_hf(out_dir, hf_dataset_id, hf_token)
+            hf_note = " [uploaded to HF]"
+
         print(f"[بناء] batch {batch_num}/{len(batches)}: تحميل {len(batch)} في {_fmt_duration(download_seconds)} | "
-              f"مقبول {n_ok}, فشل تحميل {n_dl_fail}, مفيش وش {n_no_face}, أكتر من وش {n_multi}. [saved]")
+              f"مقبول {n_ok}, فشل تحميل {n_dl_fail}, مفيش وش {n_no_face}, أكتر من وش {n_multi}. [saved]{hf_note}")
 
     return db_ids, db_names, db_file_types, db_images, np.asarray(embeddings_buffer, dtype=np.float32)
 
@@ -418,12 +481,16 @@ def main():
     entries = load_records(args.with_tpdb, "with_tpdb") + load_records(args.without_tpdb, "without_tpdb")
     print(f"تم تحميل {len(entries)} عنصر ليهم image (بعد استبعاد اللي مفيهوش).")
 
+    if args.hf_dataset_id and args.hf_token:
+        download_checkpoint_from_hf(out_dir, args.hf_dataset_id, args.hf_token)
+
     adaface_model_path = str(Path(args.data_dir) / "adaface" / "adaface_vit_b_mha_fused.int8q.onnx")
     embedder = AdaFaceEmbedder(adaface_model_path, device_id=args.device_id)
     report_gpu_status(embedder, args.device_id)
 
     db_ids, db_names, db_file_types, db_images, embeddings = build_phase(
         entries, embedder, out_dir, args.batch_size, args.download_workers,
+        hf_dataset_id=args.hf_dataset_id, hf_token=args.hf_token,
     )
     print(f"انتهت مرحلة البناء: {len(db_ids)} عنصر دخلوا القاعدة فعليًا.")
 
