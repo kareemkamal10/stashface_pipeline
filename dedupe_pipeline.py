@@ -295,32 +295,43 @@ class _DSU:
             self.parent[ra] = rb
 
 
-def query_phase(db_ids, db_names, db_file_types, db_images, embeddings: np.ndarray, out_dir: Path):
+def query_phase(db_ids, db_names, db_file_types, db_images, embeddings: np.ndarray, out_dir: Path,
+                 query_chunk_size: int = 2000):
     if embeddings.shape[0] == 0:
         print("[استعلام] القاعدة فاضية، مفيش حاجة تتقارن.")
         return
+
+    n = len(db_ids)
 
     # الـ embeddings من AdaFace متوقع تكون L2-normalized بالفعل، فالـ dot
     # product = cosine similarity مباشرة.
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms[norms == 0] = 1e-12
-    normed = embeddings / norms
-    sims = normed @ normed.T  # matrix مربعة: sims[i, j] = تشابه العنصر i مع j
+    normed = (embeddings / norms).astype(np.float32)
 
-    n = len(db_ids)
+    # مهم: مش بنبني مصفوفة n×n كاملة مرة واحدة (لـ n كبير زي 126K ده هيبقى
+    # عشرات الجيجا رام ومستحيل يتحمّل). بدل كده بنحسب التشابه على دفعات
+    # (chunk من الصفوف في المرة الواحدة × كل الـ DB)، ناخد أقرب top-K من كل
+    # دفعة، ونرمي باقي الدفعة من الرام قبل ما نكمل للي بعدها.
     dsu = _DSU(n)
+    n_chunks = (n + query_chunk_size - 1) // query_chunk_size
+    for chunk_num, start in enumerate(range(0, n, query_chunk_size), start=1):
+        end = min(start + query_chunk_size, n)
+        chunk_sims = normed[start:end] @ normed.T  # (chunk_len, n)
 
-    # لكل عنصر: نضم لنفس المجموعة أي نتيجة من أقرب top-10 (غير نفسه)
-    # تخطت أدنى threshold (55%) - ده بيمسك حتى الحالات اللي مش بعضها
-    # top-1 لبعض (زي شخص عنده 3 صور، مش كلهم متطابقين بنفس القوة)
-    for i in range(n):
-        order = np.argsort(-sims[i])[:TOP_K + 1]
-        for j in order:
-            if db_file_types[j] == db_file_types[i] and db_ids[j] == db_ids[i]:
-                continue  # نفس العنصر - استبعاد بالـ id مش بالترتيب
-            score = float(sims[i, j]) * 100
-            if score >= REVIEW_THRESHOLD:
-                dsu.union(i, j)
+        for local_i in range(end - start):
+            i = start + local_i
+            row = chunk_sims[local_i]
+            order = np.argsort(-row)[:TOP_K + 1]
+            for j in order:
+                if db_file_types[j] == db_file_types[i] and db_ids[j] == db_ids[i]:
+                    continue  # نفس العنصر - استبعاد بالـ id مش بالترتيب
+                score = float(row[j]) * 100
+                if score >= REVIEW_THRESHOLD:
+                    dsu.union(i, j)
+
+        del chunk_sims
+        print(f"[استعلام] دفعة {chunk_num}/{n_chunks} ({end - start} عنصر) اتقارنت.")
 
     raw_groups = {}
     for i in range(n):
@@ -332,15 +343,17 @@ def query_phase(db_ids, db_names, db_file_types, db_images, embeddings: np.ndarr
             continue
 
         # الـ anchor = العضو الأكتر تمثيلاً للمجموعة (أعلى مجموع تشابه مع
-        # باقي الأعضاء) - باقي الأعضاء بتتقاس نسبتهم بالنسبة له
+        # باقي الأعضاء) - المجموعة نفسها صغيرة (كذا عنصر عادةً)، فحساب
+        # التشابه بينهم بس (مش مع كل الـ DB) رخيص جدًا ومش محتاج المصفوفة
+        # الكبيرة خالص.
         idxs_arr = np.array(idxs)
-        sub = sims[np.ix_(idxs_arr, idxs_arr)]
+        sub = normed[idxs_arr] @ normed[idxs_arr].T
         anchor_pos = int(np.argmax(sub.sum(axis=1)))
         anchor_idx = idxs[anchor_pos]
 
         members = []
-        for idx in idxs:
-            score = 100.0 if idx == anchor_idx else round(float(sims[anchor_idx, idx]) * 100, 2)
+        for pos, idx in enumerate(idxs):
+            score = 100.0 if idx == anchor_idx else round(float(sub[anchor_pos, pos]) * 100, 2)
             members.append({
                 "id": db_ids[idx],
                 "file_type": db_file_types[idx],
@@ -392,6 +405,8 @@ def main():
     ap.add_argument("--data-dir", default=str(DATA_DIR))
     ap.add_argument("--device-id", type=int, default=None, help="GPU device id (افتراضي: CPU)")
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    ap.add_argument("--query-chunk-size", type=int, default=2000,
+                     help="عدد الصفوف اللي بتتقارن مع الـ DB مرة واحدة في الاستعلام (يتحكم في استهلاك الرام)")
     ap.add_argument("--download-workers", type=int, default=DOWNLOAD_WORKERS)
     ap.add_argument("--hf-dataset-id", default=None, help="لو محدد، هيترفع كل حاجة لـ reports/ جوا الـ repo ده")
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
@@ -412,7 +427,7 @@ def main():
     )
     print(f"انتهت مرحلة البناء: {len(db_ids)} عنصر دخلوا القاعدة فعليًا.")
 
-    query_phase(db_ids, db_names, db_file_types, db_images, embeddings, out_dir)
+    query_phase(db_ids, db_names, db_file_types, db_images, embeddings, out_dir, args.query_chunk_size)
 
     if args.hf_dataset_id:
         if not args.hf_token:
