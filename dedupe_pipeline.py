@@ -29,11 +29,17 @@ performers_without_tpdb.json مع بعض، باستخدام نفس detection/emb
   "reports/" جوا نفس الـ HF dataset repo.
 
 الاستخدام (على Kaggle، بعد ما setup.py يزامن الموديل):
-    python dedupe_pipeline.py \
+    python dedupe_pipeline.py --mode build \
         --hf-dataset-id <repo_id> \
         --hf-token $HF_TOKEN \
         --data-dir /kaggle/temp/stashface-data
+
+المرحلة الأولى (--mode build) بس محتاجة GPU وموديلات كشف/embedding. المرحلة
+التانية (--mode query) محتاجة numpy بس - ملهاش أي اعتماد على insightface/
+onnxruntime، فتقدر تشغلها في notebook تاني أخف بكتير (حتى من غير GPU).
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -48,7 +54,6 @@ import numpy as np
 import requests
 from PIL import Image
 
-from models.face_recognition import AdaFaceEmbedder, MIN_FACE_CONFIDENCE, extract_faces, _cuda_runtime_available
 from models.paths import DATA_DIR
 
 INPUT_WITH_TPDB = "performers_with_tpdb.json"
@@ -69,7 +74,6 @@ DEFAULT_BATCH_SIZE = 5000
 OUT_ACCEPTED_DB = "face_db.npz"
 OUT_DOWNLOAD_FAILED = "download_failed.json"
 OUT_NO_FACE = "no_face_detected.json"
-OUT_MULTI_FACE = "multiple_faces_detected.json"
 OUT_GROUPS = "duplicate_groups.json"
 
 
@@ -113,9 +117,11 @@ def _key(entry: dict) -> str:
     return f"{entry['file_type']}:{entry['id']}"
 
 
-def report_gpu_status(embedder: AdaFaceEmbedder, device_id: Optional[int]):
+def report_gpu_status(embedder, device_id: Optional[int]):
     """يطبع بصراحة هل الـ GPU شغال فعليًا ولا لأ - عشان مفيش أي fallback
     صامت لـ CPU من غير ما تعرف."""
+    from models.face_recognition import _cuda_runtime_available
+
     cuda_ok = _cuda_runtime_available()
     actual_providers = embedder.session.get_providers()
     embedder_on_gpu = bool(actual_providers) and actual_providers[0] == "CUDAExecutionProvider"
@@ -210,7 +216,7 @@ def save_db_atomic(path: str, ids, names, file_types, images, embeddings):
 
 # --- مزامنة الـ checkpoints مع HF (حماية من فقدان التقدم لو الجلسة راحت) ---
 
-CHECKPOINT_FILES = [OUT_DOWNLOAD_FAILED, OUT_NO_FACE, OUT_MULTI_FACE, OUT_ACCEPTED_DB]
+CHECKPOINT_FILES = [OUT_DOWNLOAD_FAILED, OUT_NO_FACE, OUT_ACCEPTED_DB]
 
 
 def download_checkpoint_from_hf(out_dir: Path, hf_dataset_id: str, hf_token: str):
@@ -267,18 +273,18 @@ def upload_checkpoint_to_hf(out_dir: Path, hf_dataset_id: str, hf_token: str):
 
 # --- المرحلة 1: البناء -------------------------------------------------
 
-def build_phase(all_entries: list, embedder: AdaFaceEmbedder, out_dir: Path,
+def build_phase(all_entries: list, embedder, out_dir: Path,
                  batch_size: int, download_workers: int,
                  hf_dataset_id: Optional[str] = None, hf_token: Optional[str] = None):
+    from models.face_recognition import MIN_FACE_CONFIDENCE, extract_faces
+
     download_failed = load_json_list(str(out_dir / OUT_DOWNLOAD_FAILED))
     no_face = load_json_list(str(out_dir / OUT_NO_FACE))
-    multi_face = load_json_list(str(out_dir / OUT_MULTI_FACE))
     db_ids, db_names, db_file_types, db_images, db_embeddings = load_db_checkpoint(str(out_dir / OUT_ACCEPTED_DB))
 
     done_keys = set()
     done_keys.update(f"{e['file_type']}:{e['id']}" for e in download_failed)
     done_keys.update(f"{e['file_type']}:{e['id']}" for e in no_face)
-    done_keys.update(f"{e['file_type']}:{e['id']}" for e in multi_face)
     done_keys.update(f"{ft}:{i}" for ft, i in zip(db_file_types, db_ids))
 
     todo = [e for e in all_entries if _key(e) not in done_keys]
@@ -291,7 +297,7 @@ def build_phase(all_entries: list, embedder: AdaFaceEmbedder, out_dir: Path,
         downloaded, download_seconds = download_batch(batch, download_workers)
 
         batch_new_embeddings = []
-        n_ok = n_dl_fail = n_no_face = n_multi = 0
+        n_ok = n_dl_fail = n_no_face = 0
 
         for entry, image_array, error in downloaded:
             if image_array is None:
@@ -305,12 +311,14 @@ def build_phase(all_entries: list, embedder: AdaFaceEmbedder, out_dir: Path,
                 no_face.append({k: entry[k] for k in ("id", "name", "image", "source", "file_type")})
                 n_no_face += 1
                 continue
-            if len(faces) > 1:
-                multi_face.append({k: entry[k] for k in ("id", "name", "image", "source", "file_type")})
-                n_multi += 1
-                continue
 
-            face_batch = np.expand_dims(faces[0]["face"], axis=0)
+            # زي الكود الأصلي بالظبط: لو فيه أكتر من وش (شخص + صورة معلقة على
+            # الحيطة، تاتو وش، شخص تاني في الخلفية...)، ماخدش قرار الرفض -
+            # بناخد الوش الأعلى ثقة (confidence) من الموديل، لأن الوش
+            # الحقيقي بياخد ثقة أعلى من أي تمثيل مش حقيقي للوش غالبًا.
+            best_face = max(faces, key=lambda f: f["confidence"])
+
+            face_batch = np.expand_dims(best_face["face"], axis=0)
             emb = embedder.embed_batch(face_batch)[0]
             db_ids.append(entry["id"])
             db_names.append(entry["name"])
@@ -324,7 +332,6 @@ def build_phase(all_entries: list, embedder: AdaFaceEmbedder, out_dir: Path,
 
         save_json_atomic(str(out_dir / OUT_DOWNLOAD_FAILED), download_failed)
         save_json_atomic(str(out_dir / OUT_NO_FACE), no_face)
-        save_json_atomic(str(out_dir / OUT_MULTI_FACE), multi_face)
         save_db_atomic(str(out_dir / OUT_ACCEPTED_DB), db_ids, db_names, db_file_types, db_images, embeddings_buffer)
 
         hf_note = ""
@@ -333,7 +340,7 @@ def build_phase(all_entries: list, embedder: AdaFaceEmbedder, out_dir: Path,
             hf_note = " [uploaded to HF]"
 
         print(f"[بناء] batch {batch_num}/{len(batches)}: تحميل {len(batch)} في {_fmt_duration(download_seconds)} | "
-              f"مقبول {n_ok}, فشل تحميل {n_dl_fail}, مفيش وش {n_no_face}, أكتر من وش {n_multi}. [saved]{hf_note}")
+              f"مقبول {n_ok}, فشل تحميل {n_dl_fail}, مفيش وش {n_no_face}. [saved]{hf_note}")
 
     return db_ids, db_names, db_file_types, db_images, np.asarray(embeddings_buffer, dtype=np.float32)
 
@@ -445,7 +452,7 @@ def query_phase(db_ids, db_names, db_file_types, db_images, embeddings: np.ndarr
 def upload_reports(out_dir: Path, hf_dataset_id: str, hf_token: str):
     from huggingface_hub import HfApi
     api = HfApi(token=hf_token)
-    for filename in [OUT_ACCEPTED_DB, OUT_DOWNLOAD_FAILED, OUT_NO_FACE, OUT_MULTI_FACE, OUT_GROUPS]:
+    for filename in [OUT_ACCEPTED_DB, OUT_DOWNLOAD_FAILED, OUT_NO_FACE, OUT_GROUPS]:
         local_path = out_dir / filename
         if not local_path.exists():
             continue
@@ -462,45 +469,65 @@ def upload_reports(out_dir: Path, hf_dataset_id: str, hf_token: str):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--mode", choices=["build", "query"], required=True,
+                    help="build: تحميل+كشف+embedding ورفع الـ DB على HF. "
+                         "query: تحميل الـ DB من HF وعمل المقارنة بس (مش محتاج GPU)")
     ap.add_argument("--with-tpdb", default=INPUT_WITH_TPDB)
     ap.add_argument("--without-tpdb", default=INPUT_WITHOUT_TPDB)
     ap.add_argument("--out-dir", default="dedupe_reports")
     ap.add_argument("--data-dir", default=str(DATA_DIR))
-    ap.add_argument("--device-id", type=int, default=None, help="GPU device id (افتراضي: CPU)")
+    ap.add_argument("--device-id", type=int, default=None, help="GPU device id (افتراضي: CPU) - لـ build بس")
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     ap.add_argument("--query-chunk-size", type=int, default=2000,
                      help="عدد الصفوف اللي بتتقارن مع الـ DB مرة واحدة في الاستعلام (يتحكم في استهلاك الرام)")
     ap.add_argument("--download-workers", type=int, default=DOWNLOAD_WORKERS)
-    ap.add_argument("--hf-dataset-id", default=None, help="لو محدد، هيترفع كل حاجة لـ reports/ جوا الـ repo ده")
+    ap.add_argument("--hf-dataset-id", default=None, help="لو محدد، هيترفع/يتحمّل منه على reports/ جوا الـ repo ده")
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    entries = load_records(args.with_tpdb, "with_tpdb") + load_records(args.without_tpdb, "without_tpdb")
-    print(f"تم تحميل {len(entries)} عنصر ليهم image (بعد استبعاد اللي مفيهوش).")
+    if args.mode == "build":
+        from models.face_recognition import AdaFaceEmbedder
 
-    if args.hf_dataset_id and args.hf_token:
+        entries = load_records(args.with_tpdb, "with_tpdb") + load_records(args.without_tpdb, "without_tpdb")
+        print(f"تم تحميل {len(entries)} عنصر ليهم image (بعد استبعاد اللي مفيهوش).")
+
+        if args.hf_dataset_id and args.hf_token:
+            download_checkpoint_from_hf(out_dir, args.hf_dataset_id, args.hf_token)
+
+        adaface_model_path = str(Path(args.data_dir) / "adaface" / "adaface_vit_b_mha_fused.int8q.onnx")
+        embedder = AdaFaceEmbedder(adaface_model_path, device_id=args.device_id)
+        report_gpu_status(embedder, args.device_id)
+
+        db_ids, db_names, db_file_types, db_images, embeddings = build_phase(
+            entries, embedder, out_dir, args.batch_size, args.download_workers,
+            hf_dataset_id=args.hf_dataset_id, hf_token=args.hf_token,
+        )
+        print(f"انتهت مرحلة البناء: {len(db_ids)} عنصر دخلوا القاعدة فعليًا.")
+
+        if args.hf_dataset_id:
+            if not args.hf_token:
+                print("WARNING: --hf-dataset-id محدد بس مفيش --hf-token/HF_TOKEN، هتخطى الرفع.", file=sys.stderr)
+            else:
+                upload_checkpoint_to_hf(out_dir, args.hf_dataset_id, args.hf_token)
+                print(f"[رفع] القاعدة النهائية اترفعت على {args.hf_dataset_id}/{REPORTS_DIR_IN_REPO}/")
+
+        print("خلص البناء. شغّل نفس الأمر بـ --mode query (notebook تاني، مش محتاج GPU) عشان تعمل المقارنة.")
+
+    else:  # query
+        if not (args.hf_dataset_id and args.hf_token):
+            sys.exit("--mode query محتاج --hf-dataset-id و --hf-token عشان يحمّل الـ DB اللي اتبنت في الـ build notebook.")
+
         download_checkpoint_from_hf(out_dir, args.hf_dataset_id, args.hf_token)
+        db_ids, db_names, db_file_types, db_images, embeddings = load_db_checkpoint(str(out_dir / OUT_ACCEPTED_DB))
+        if not db_ids:
+            sys.exit("مفيش قاعدة بيانات (face_db.npz) لقيتها على HF - تأكد إن الـ build notebook خلص ورفعها الأول.")
+        print(f"اتحمّلت القاعدة: {len(db_ids)} عنصر.")
 
-    adaface_model_path = str(Path(args.data_dir) / "adaface" / "adaface_vit_b_mha_fused.int8q.onnx")
-    embedder = AdaFaceEmbedder(adaface_model_path, device_id=args.device_id)
-    report_gpu_status(embedder, args.device_id)
-
-    db_ids, db_names, db_file_types, db_images, embeddings = build_phase(
-        entries, embedder, out_dir, args.batch_size, args.download_workers,
-        hf_dataset_id=args.hf_dataset_id, hf_token=args.hf_token,
-    )
-    print(f"انتهت مرحلة البناء: {len(db_ids)} عنصر دخلوا القاعدة فعليًا.")
-
-    query_phase(db_ids, db_names, db_file_types, db_images, embeddings, out_dir, args.query_chunk_size)
-
-    if args.hf_dataset_id:
-        if not args.hf_token:
-            print("WARNING: --hf-dataset-id محدد بس مفيش --hf-token/HF_TOKEN، هتخطى الرفع.", file=sys.stderr)
-        else:
-            upload_reports(out_dir, args.hf_dataset_id, args.hf_token)
+        query_phase(db_ids, db_names, db_file_types, db_images, embeddings, out_dir, args.query_chunk_size)
+        upload_reports(out_dir, args.hf_dataset_id, args.hf_token)
 
     print("خلص.")
 
